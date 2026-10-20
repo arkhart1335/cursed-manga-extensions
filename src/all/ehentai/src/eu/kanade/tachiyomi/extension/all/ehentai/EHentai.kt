@@ -41,6 +41,7 @@ import okhttp3.Response
 import org.jsoup.nodes.Element
 import java.net.URLEncoder
 import java.time.ZoneOffset
+import java.util.concurrent.atomic.AtomicLong
 
 @Source
 abstract class EHentai :
@@ -86,9 +87,17 @@ abstract class EHentai :
 
     // Listings are paged with a "next" cursor (last gallery id of the previous page), not page numbers.
     // Cursors are kept per listing url and page, so interleaved listings and searches can't overwrite each other.
-    private val nextCursors = object : LinkedHashMap<String, String>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean = size > MAX_CURSORS
+    // The cache is bounded, so a cursor can be evicted: loadListing rebuilds it instead of ending the listing.
+    private class Cursor(val requestId: Long, val value: String)
+
+    private val nextCursors = object : LinkedHashMap<String, Cursor>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Cursor>): Boolean = size > MAX_CURSORS
     }
+
+    // Ordered by when a listing request was sent, so a slow older response can't replace a newer cursor
+    private val listingRequestCounter = AtomicLong()
+
+    private class ListingResult(val page: MangasPage, val nextCursor: String?)
 
     private fun cursorKey(listingUrl: String, page: Int) = "$listingUrl#$page"
 
@@ -163,19 +172,40 @@ abstract class EHentai :
     private suspend fun fetchGallery(idAndToken: String): SManga = client.get("$baseUrl/g/$idAndToken").toMangaDetails()
 
     private suspend fun loadListing(listingUrl: String, page: Int, useFrom: Boolean = false): MangasPage {
+        // Resume from the nearest page whose cursor is still cached, or from the first page if none is
+        var current = 1
+        var cursor: String? = null
+        for (candidate in page downTo 2) {
+            val cached = synchronized(nextCursors) { nextCursors[cursorKey(listingUrl, candidate)] }
+            if (cached != null) {
+                current = candidate
+                cursor = cached.value
+                break
+            }
+        }
+
+        while (true) {
+            val result = fetchListingPage(listingUrl, current, cursor, useFrom)
+            if (current == page) return result.page
+            if (!result.page.hasNextPage) return MangasPage(emptyList(), false)
+            cursor = result.nextCursor ?: return MangasPage(emptyList(), false)
+            current++
+        }
+    }
+
+    private suspend fun fetchListingPage(listingUrl: String, page: Int, cursor: String?, useFrom: Boolean): ListingResult {
+        val requestId = listingRequestCounter.incrementAndGet()
         var url = listingUrl
-        if (page > 1) {
-            val cursor = synchronized(nextCursors) { nextCursors[cursorKey(listingUrl, page)] }
-                ?: return MangasPage(emptyList(), false)
+        if (cursor != null) {
             if (useFrom) url = addParam(url, "from", cursor)
             url = addParam(url, "next", cursor)
         }
-        return parseMangaPage(client.get(url), listingUrl, page)
+        return parseMangaPage(client.get(url), listingUrl, page, requestId)
     }
 
     private fun languageTag(enforceLanguageFilter: Boolean = false): String = if (enforceLanguageFilter || getEnforceLanguagePref()) "language:$ehLang" else ""
 
-    private fun parseMangaPage(response: Response, listingUrl: String, page: Int): MangasPage {
+    private fun parseMangaPage(response: Response, listingUrl: String, page: Int, requestId: Long): ListingResult {
         val doc = response.asJsoup()
         val mangaElements = doc.select("table.itg td.glname")
             .let { elements ->
@@ -205,12 +235,18 @@ abstract class EHentai :
             ?: doc.select("table.itg td.glname").lastOrNull()?.selectFirst("a")
                 ?.let { ExGalleryMetadata.galleryId(it.attr("href")) }
         nextId?.let { id ->
-            synchronized(nextCursors) { nextCursors[cursorKey(listingUrl, page + 1)] = id }
+            val key = cursorKey(listingUrl, page + 1)
+            synchronized(nextCursors) {
+                val existing = nextCursors[key]
+                if (existing == null || existing.requestId <= requestId) {
+                    nextCursors[key] = Cursor(requestId, id)
+                }
+            }
         }
 
         val hasNextPage = doc.select("a#unext[href]").hasText()
 
-        return MangasPage(mangas, hasNextPage)
+        return ListingResult(MangasPage(mangas, hasNextPage), nextId)
     }
 
     // Details and chapters
@@ -222,7 +258,7 @@ abstract class EHentai :
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val updatedManga = if (fetchDetails) client.get("$baseUrl${manga.url}").toMangaDetails() else manga
+        val updatedManga = if (fetchDetails) client.get("$baseUrl${manga.url}").toMangaDetails(manga.url) else manga
         val updatedChapters = if (fetchChapters) {
             listOf(
                 SChapter.create().apply {
@@ -237,12 +273,17 @@ abstract class EHentai :
         return SMangaUpdate(updatedManga, updatedChapters)
     }
 
-    private fun Response.toMangaDetails(): SManga {
+    private fun Response.toMangaDetails(storedUrl: String? = null): SManga {
         val galleryPath = request.url.encodedPath
         val doc = asJsoup()
         return with(ExGalleryMetadata()) {
-            // Same url form as the listing, so a gallery has one stored url however it was added
-            url = ExGalleryMetadata.normalizeUrl(galleryPath)
+            // Same url form as the listing, so a gallery has one stored url however it was added.
+            // Entries saved by the old id search have a tokenless /g/<id>/ path: keep it as stored when the site doesn't redirect to a tokenized one
+            url = if (ExGalleryMetadata.hasToken(galleryPath)) {
+                ExGalleryMetadata.normalizeUrl(galleryPath)
+            } else {
+                storedUrl ?: galleryPath
+            }
             title = doc.select("#gn").text().nullIfBlank()
 
             altTitle = doc.select("#gj").text().nullIfBlank()

@@ -71,7 +71,7 @@ fun ExGalleryMetadata.copyTo(manga: SManga) {
             append("\n")
         }
         size?.let { append("File Size: ${humanReadableByteCount(it, true)}\n") }
-        length?.let { append("Length: $it pages\n") }
+        this@copyTo.length?.let { append("Length: $it pages\n") }
         favorites?.let { append("Favorited: $it times\n") }
         averageRating?.let {
             append("Rating: $it")
